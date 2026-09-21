@@ -79,7 +79,12 @@ class Registration(StatesGroup):
     waiting_for_fio = State()
 
 class ReportForm(StatesGroup):
-    select_plane, select_part, select_stage, enter_desc, send_photo, update_status = State(), State(), State(), State(), State(), State()
+    select_plane = State()
+    select_part = State()
+    select_stage = State()
+    enter_desc = State()
+    send_photo = State()
+    update_status = State()
 
 def main_menu_keyboard(is_admin=False):
     kb = [
@@ -199,15 +204,13 @@ async def start_report(message: Message, state: FSMContext):
     await message.answer("Выберите бортовой номер:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
     await state.set_state(ReportForm.select_plane)
 
-@router.callback_query(FormState.select_plane, F.data.startswith("rep_plane:"))
+@router.callback_query(ReportForm.select_plane, F.data.startswith("rep_plane:"))
 async def process_rep_plane(callback: CallbackQuery, state: FSMContext):
     plane_num = callback.data.split(":")[1]
     
     parts = await asyncio.to_thread(get_parts_for_plane, plane_num)
-    # Сохраняем номер борта и список всех деталей в состояние бота
     await state.update_data(plane=plane_num, parts_list=parts)
     
-    # Передаем в callback_data только индекс (число i), а не длинное название
     builder = [
         [InlineKeyboardButton(text=f"🔧 {part}", callback_data=f"rep_part:{i}")] 
         for i, part in enumerate(parts)
@@ -217,15 +220,13 @@ async def process_rep_plane(callback: CallbackQuery, state: FSMContext):
         "Выберите деталь / узел:", 
         reply_markup=InlineKeyboardMarkup(inline_keyboard=builder)
     )
-    await state.set_state(FormState.select_part)
+    await state.set_state(ReportForm.select_part)
     await callback.answer()
 
-
-@router.callback_query(FormState.select_part, F.data.startswith("rep_part:"))
+@router.callback_query(ReportForm.select_part, F.data.startswith("rep_part:"))
 async def process_rep_part(callback: CallbackQuery, state: FSMContext):
     part_idx = int(callback.data.split(":")[1])
     
-    # Достаем список деталей из памяти бота и находим название по индексу
     user_data = await state.get_data()
     parts_list = user_data.get("parts_list", [])
     selected_part = parts_list[part_idx] if part_idx < len(parts_list) else "Деталь"
@@ -238,6 +239,7 @@ async def process_rep_part(callback: CallbackQuery, state: FSMContext):
         f"Выбрана деталь: {selected_part}\nВыберите выполненный этап:", 
         reply_markup=ReplyKeyboardMarkup(keyboard=builder, resize_keyboard=True)
     )
+    await state.set_state(ReportForm.select_stage)
     await callback.answer()
 
 @router.message(ReportForm.select_stage)
