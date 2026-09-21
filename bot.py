@@ -233,7 +233,7 @@ async def process_rep_part(callback: CallbackQuery, state: FSMContext):
     
     await state.update_data(part=selected_part)
     
-    stages = ["Смывка / Демонтаж", "Подготовка / Шлифовка", "Грунтование", "Покраска", "Нанесение лака", "Сушка", "Сдача / Готово"]
+    stages = ["Подготовлено в покраску", "Готово"]
     builder = [[KeyboardButton(text=st)] for st in stages]
     await callback.message.answer(
         f"Выбрана деталь: {selected_part}\nВыберите выполненный этап:", 
