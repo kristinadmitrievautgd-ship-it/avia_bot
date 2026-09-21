@@ -199,23 +199,45 @@ async def start_report(message: Message, state: FSMContext):
     await message.answer("Выберите бортовой номер:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
     await state.set_state(ReportForm.select_plane)
 
-@router.callback_query(ReportForm.select_plane, F.data.startswith("rep_plane:"))
+@router.callback_query(FormState.select_plane, F.data.startswith("rep_plane:"))
 async def process_rep_plane(callback: CallbackQuery, state: FSMContext):
     plane_num = callback.data.split(":")[1]
-    await state.update_data(plane=plane_num)
+    
     parts = await asyncio.to_thread(get_parts_for_plane, plane_num)
-    builder = [[InlineKeyboardButton(text=f"⚙ {part}", callback_data=f"rep_part:{part}")] for part in parts]
-    await callback.message.answer("Выберите деталь / узел:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
-    await state.set_state(ReportForm.select_part)
+    # Сохраняем номер борта и список всех деталей в состояние бота
+    await state.update_data(plane=plane_num, parts_list=parts)
+    
+    # Передаем в callback_data только индекс (число i), а не длинное название
+    builder = [
+        [InlineKeyboardButton(text=f"🔧 {part}", callback_data=f"rep_part:{i}")] 
+        for i, part in enumerate(parts)
+    ]
+    
+    await callback.message.answer(
+        "Выберите деталь / узел:", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=builder)
+    )
+    await state.set_state(FormState.select_part)
     await callback.answer()
 
-@router.callback_query(ReportForm.select_part, F.data.startswith("rep_part:"))
+
+@router.callback_query(FormState.select_part, F.data.startswith("rep_part:"))
 async def process_rep_part(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(part=callback.data.split(":")[1])
+    part_idx = int(callback.data.split(":")[1])
+    
+    # Достаем список деталей из памяти бота и находим название по индексу
+    user_data = await state.get_data()
+    parts_list = user_data.get("parts_list", [])
+    selected_part = parts_list[part_idx] if part_idx < len(parts_list) else "Деталь"
+    
+    await state.update_data(part=selected_part)
+    
     stages = ["Смывка / Демонтаж", "Подготовка / Шлифовка", "Грунтование", "Покраска", "Нанесение лака", "Сушка", "Сдача / Готово"]
     builder = [[KeyboardButton(text=st)] for st in stages]
-    await callback.message.answer("Выберите выполненный этап:", reply_markup=ReplyKeyboardMarkup(keyboard=builder, resize_keyboard=True, one_time_keyboard=True))
-    await state.set_state(ReportForm.select_stage)
+    await callback.message.answer(
+        f"Выбрана деталь: {selected_part}\nВыберите выполненный этап:", 
+        reply_markup=ReplyKeyboardMarkup(keyboard=builder, resize_keyboard=True)
+    )
     await callback.answer()
 
 @router.message(ReportForm.select_stage)
