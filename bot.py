@@ -54,33 +54,49 @@ def register_user(telegram_id, fio, role="Маляр / Реставратор"):
 def get_planes():
     ws_plan, _, _ = get_sheets()
     records = ws_plan.get_all_records()
-    return sorted(list(set(str(r["Бортовой номер"]).strip() for r in records if r.get("Бортовой номер"))))
+    return sorted(list(set(str(r.get("Бортовой номер", "")).strip() for r in records if r.get("Бортовой номер"))))
 
 def get_plane_specs(plane_num):
     ws_plan, _, _ = get_sheets()
-    return [r for r in ws_plan.get_all_records() if str(r.get("Бортовой номер")).strip() == plane_num]
+    return [r for r in ws_plan.get_all_records() if str(r.get("Бортовой номер", "")).strip() == plane_num]
 
-def get_parts_for_plane(plane_num):
-    specs = get_plane_specs(plane_num)
-    return [str(r.get("Деталь / Узел")).strip() for r in specs if r.get("Деталь / Узел")]
+def parse_float(val):
+    try:
+        if not val:
+            return 0.0
+        return float(str(val).replace(',', '.').strip())
+    except ValueError:
+        return 0.0
 
-def add_report(fio, plane, part, stage, desc, photo_id="—"):
+def add_report(report_date, fio, plane, part, stage, qty, earned_hours, desc, photo_id="—"):
     _, ws_reports, _ = get_sheets()
-    now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
-    ws_reports.append_row([now_str, fio, plane, part, stage, desc, photo_id])
+    ws_reports.append_row([report_date, fio, plane, part, stage, qty, earned_hours, desc, photo_id])
+
+def calculate_daily_hours(fio, report_date):
+    _, ws_reports, _ = get_sheets()
+    records = ws_reports.get_all_records()
+    total = 0.0
+    for r in records:
+        if str(r.get("ФИО Маляра", "")).strip().lower() == fio.strip().lower():
+            row_date = str(r.get("Дата и время", "")).split()[0]
+            if row_date == report_date:
+                total += parse_float(r.get("Заработано Н/ч", 0))
+    return round(total, 2)
 
 def update_part_status(plane, part, new_status):
     ws_plan, _, _ = get_sheets()
     records = ws_plan.get_all_records()
     for idx, r in enumerate(records, start=2):
-        if str(r.get("Бортовой номер")).strip() == plane and str(r.get("Деталь / Узел")).strip() == part:
+        part_name = r.get("Деталь / Узел") or r.get("Компонент") or ""
+        if str(r.get("Бортовой номер", "")).strip() == plane and str(part_name).strip() == part:
             ws_plan.update_cell(idx, 6, new_status)
             break
 
 def get_reports_by_user(fio):
     _, ws_reports, _ = get_sheets()
     records = ws_reports.get_all_records()
-    return [r for r in records if str(r.get("ФИО Маляра")).strip().lower() == fio.strip().lower()]
+    return [r for r in records if str(r.get("ФИО Маляра", "")).strip().lower() == fio.strip().lower()]
+
 
 # --- ФУНКЦИИ ПОИСКА ТМЦ ---
 def search_tmc_items(query):
@@ -128,9 +144,12 @@ class Registration(StatesGroup):
     waiting_for_fio = State()
 
 class ReportForm(StatesGroup):
+    select_date = State()
+    custom_date = State()
     select_plane = State()
     select_part = State()
     select_stage = State()
+    select_qty = State()
     enter_desc = State()
     send_photo = State()
     update_status = State()
@@ -253,7 +272,6 @@ async def tmc_show_category_items(callback: CallbackQuery):
         await callback.answer()
         return
     
-    # Берем ВСЕ элементы только из Столбца A (пропуская первую строку-заголовок)
     pn_list = []
     for r in rows[1:]:
         if r and len(r) > 0:
@@ -285,6 +303,257 @@ async def tmc_show_category_items(callback: CallbackQuery):
     for msg in messages:
         await callback.message.answer(msg, parse_mode="Markdown")
         
+    await callback.answer()
+
+
+# --- РАЗДЕЛ СПЕЦИФИКАЦИЙ ПО БОРТУ ---
+@router.message(F.text == "✈ План и краски по борту")
+async def show_planes_list(message: Message):
+    planes = await asyncio.to_thread(get_planes)
+    if not planes:
+        await message.answer("В таблице `План_и_Спецификации` нет занесенных самолетов.")
+        return
+    builder = [[InlineKeyboardButton(text=f"✈ Борт {p}", callback_data=f"info_plane:{p}")] for p in planes]
+    await message.answer("Выберите бортовой номер самолета:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
+
+@router.callback_query(F.data.startswith("info_plane:"))
+async def process_plane_info(callback: CallbackQuery):
+    plane_num = callback.data.split(":")[1]
+    specs = await asyncio.to_thread(get_plane_specs, plane_num)
+    
+    if not specs:
+        await callback.message.answer(f"По борту **{plane_num}** нет сохраненных деталей.", parse_mode="Markdown")
+        await callback.answer()
+        return
+
+    header = f"✈ **Спецификации по борту {plane_num}:**\n\n"
+    current_msg = header
+    messages = []
+    
+    for idx, item in enumerate(specs, start=1):
+        part_name = str(item.get('Деталь / Узел') or item.get('Компонент') or '—').strip()
+        paint = str(item.get('Номер / Марка краски') or item.get('p/n краски') or '—').strip()
+        primer = str(item.get('Грунт / Подготовка') or '—').strip()
+        deadline = str(item.get('Срок сдачи (Дедлайн)') or '—').strip()
+        status = str(item.get('Текущий статус') or 'Не указан').strip()
+
+        item_text = (
+            f"**{idx}. {part_name}**\n"
+            f"🎨 Краска: `{paint}`\n"
+            f"🧪 Грунт: `{primer}`\n"
+            f"📅 Сдать до: **{deadline}**\n"
+            f"📌 Статус: *{status}*\n\n"
+        )
+        
+        if len(current_msg) + len(item_text) > 3500:
+            messages.append(current_msg)
+            current_msg = f"✈ **Спецификации по борту {plane_num} (продолжение):**\n\n" + item_text
+        else:
+            current_msg += item_text
+            
+    if current_msg:
+        messages.append(current_msg)
+        
+    for msg in messages:
+        await callback.message.answer(msg, parse_mode="Markdown")
+        
+    await callback.answer()
+
+
+# --- РАЗДЕЛ СДАЧИ ОТЧЕТОВ С ВЫБОРОМ ДАТЫ И РАСЧЕТОМ НОРМА-ЧАСОВ ---
+@router.message(F.text == "📝 Сдать отчет")
+async def start_report(message: Message, state: FSMContext):
+    today = datetime.datetime.now().strftime("%d.%m.%Y")
+    yesterday = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%d.%m.%Y")
+    
+    kb = [
+        [InlineKeyboardButton(text=f"📅 Сегодня ({today})", callback_data=f"rep_date:{today}")],
+        [InlineKeyboardButton(text=f"📅 Вчера ({yesterday})", callback_data=f"rep_date:{yesterday}")],
+        [InlineKeyboardButton(text="✏ Ввести дату вручную", callback_data="rep_date_custom")]
+    ]
+    await message.answer("📆 **За какой день сдается отчет?**", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    await state.set_state(ReportForm.select_date)
+
+@router.callback_query(ReportForm.select_date, F.data == "rep_date_custom")
+async def prompt_custom_date(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите дату отчета в формате **ДД.ММ.ГГГГ** (например: `25.09.2026`):", parse_mode="Markdown")
+    await state.set_state(ReportForm.custom_date)
+    await callback.answer()
+
+@router.message(ReportForm.custom_date)
+async def process_custom_date(message: Message, state: FSMContext):
+    date_text = message.text.strip()
+    try:
+        valid_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").strftime("%d.%m.%Y")
+        await state.update_data(report_date=valid_date)
+        await ask_plane_for_report(message, state)
+    except ValueError:
+        await message.answer("❌ Неверный формат даты. Пожалуйста, введите дату в формате **ДД.ММ.ГГГГ** (например: `25.09.2026`):")
+
+@router.callback_query(ReportForm.select_date, F.data.startswith("rep_date:"))
+async def process_date_choice(callback: CallbackQuery, state: FSMContext):
+    selected_date = callback.data.split(":", 1)[1]
+    await state.update_data(report_date=selected_date)
+    await ask_plane_for_report(callback.message, state)
+    await callback.answer()
+
+async def ask_plane_for_report(message: Message, state: FSMContext):
+    planes = await asyncio.to_thread(get_planes)
+    if not planes:
+        await message.answer("В плане нет активных самолетов.")
+        return
+    builder = [[InlineKeyboardButton(text=f"✈ {p}", callback_data=f"rep_plane:{p}")] for p in planes]
+    await message.answer("Выберите бортовой номер:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
+    await state.set_state(ReportForm.select_plane)
+
+@router.callback_query(ReportForm.select_plane, F.data.startswith("rep_plane:"))
+async def process_rep_plane(callback: CallbackQuery, state: FSMContext):
+    plane_num = callback.data.split(":")[1]
+    specs = await asyncio.to_thread(get_plane_specs, plane_num)
+    
+    await state.update_data(plane=plane_num, specs=specs)
+    
+    builder = []
+    for i, item in enumerate(specs):
+        part_name = item.get('Деталь / Узел') or item.get('Компонент') or f"Деталь #{i+1}"
+        builder.append([InlineKeyboardButton(text=f"🔧 {part_name}", callback_data=f"rep_part:{i}")])
+    
+    await callback.message.answer("Выберите деталь / узел:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
+    await state.set_state(ReportForm.select_part)
+    await callback.answer()
+
+@router.callback_query(ReportForm.select_part, F.data.startswith("rep_part:"))
+async def process_rep_part(callback: CallbackQuery, state: FSMContext):
+    part_idx = int(callback.data.split(":")[1])
+    user_data = await state.get_data()
+    specs = user_data.get("specs", [])
+    
+    selected_spec = specs[part_idx] if part_idx < len(specs) else {}
+    part_name = selected_spec.get('Деталь / Узел') or selected_spec.get('Компонент') or "Деталь"
+    
+    await state.update_data(part=part_name, selected_spec=selected_spec)
+    
+    stages = ["Готово", "Структурный ремонт"]
+    builder = [[KeyboardButton(text=st)] for st in stages]
+    
+    await callback.message.answer(
+        f"Выбрана деталь: **{part_name}**\nВыберите выполненный этап:", 
+        reply_markup=ReplyKeyboardMarkup(keyboard=builder, resize_keyboard=True),
+        parse_mode="Markdown"
+    )
+    await state.set_state(ReportForm.select_stage)
+    await callback.answer()
+
+@router.message(ReportForm.select_stage)
+async def process_rep_stage(message: Message, state: FSMContext):
+    stage = message.text.strip()
+    await state.update_data(stage=stage)
+    
+    builder = [
+        [InlineKeyboardButton(text="1 шт", callback_data="qty:1"), InlineKeyboardButton(text="2 шт", callback_data="qty:2")],
+        [InlineKeyboardButton(text="3 шт", callback_data="qty:3"), InlineKeyboardButton(text="4 шт", callback_data="qty:4")],
+        [InlineKeyboardButton(text="5 шт", callback_data="qty:5"), InlineKeyboardButton(text="6 шт", callback_data="qty:6")]
+    ]
+    await message.answer("Укажите количество обработанных штук:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
+    await state.set_state(ReportForm.select_qty)
+
+@router.callback_query(ReportForm.select_qty, F.data.startswith("qty:"))
+async def process_rep_qty(callback: CallbackQuery, state: FSMContext):
+    qty = int(callback.data.split(":")[1])
+    await state.update_data(qty=qty)
+    
+    await callback.message.answer("Напишите краткое описание выполненных работ:", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(ReportForm.enter_desc)
+    await callback.answer()
+
+@router.message(ReportForm.enter_desc)
+async def process_rep_desc(message: Message, state: FSMContext):
+    await state.update_data(desc=message.text.strip())
+    kb = [[InlineKeyboardButton(text="Пропустить фото ⏩", callback_data="skip_photo")]]
+    await message.answer("Прикрепите фото работы (или нажмите 'Пропустить'):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await state.set_state(ReportForm.send_photo)
+
+@router.callback_query(ReportForm.send_photo, F.data == "skip_photo")
+async def process_skip_photo(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(photo="—")
+    await ask_status_update(callback.message, state)
+    await callback.answer()
+
+@router.message(ReportForm.send_photo, F.photo)
+async def process_rep_photo(message: Message, state: FSMContext):
+    await state.update_data(photo=message.photo[-1].file_id)
+    await ask_status_update(message, state)
+
+async def ask_status_update(message: Message, state: FSMContext):
+    statuses = ["В работе", "На сушке", "Готово", "Не менять"]
+    builder = [[InlineKeyboardButton(text=s, callback_data=f"set_st:{s}")] for s in statuses]
+    await message.answer("Изменить текущий статус детали в плане?", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
+    await state.set_state(ReportForm.update_status)
+
+@router.callback_query(ReportForm.update_status, F.data.startswith("set_st:"))
+async def process_finish_report(callback: CallbackQuery, state: FSMContext):
+    new_status = callback.data.split(":")[1]
+    data = await state.get_data()
+    
+    user_data = await asyncio.to_thread(get_user_data, callback.from_user.id)
+    user_fio = user_data["fio"] if user_data else f"ID: {callback.from_user.id}"
+
+    spec = data.get("selected_spec", {})
+    stage = data.get("stage", "")
+    qty = data.get("qty", 1)
+    
+    # --- ЛОГИКА РАСЧЕТА НОРМА-ЧАСОВ ---
+    struct_nh_1st = parse_float(spec.get("Н/ч Структ. ремонт, за 1 шт.") or spec.get("Н/ч Структ. ремонт"))
+    paint_nh_1st = parse_float(spec.get("Н/ч Покраска за 1 шт.") or spec.get("Н/ч Покраска"))
+    nh_per_1 = parse_float(spec.get("Н/ч на 1 изд.") or spec.get("Н/ч на 1 шт."))
+    nh_total = parse_float(spec.get("Н/ч общ.") or spec.get("Н/ч всего"))
+    total_qty_in_plan = parse_float(spec.get("Кол-во в раб.") or spec.get("Количество") or spec.get("Кол-во"))
+
+    # Вычисление стоимости 1 шт., если нет прямого значения:
+    if struct_nh_1st == 0 and paint_nh_1st == 0:
+        if nh_per_1 > 0:
+            struct_nh_1st = nh_per_1 * 0.60
+            paint_nh_1st = nh_per_1 * 0.40
+        elif nh_total > 0 and total_qty_in_plan > 0:
+            per_item = nh_total / total_qty_in_plan
+            struct_nh_1st = per_item * 0.60
+            paint_nh_1st = per_item * 0.40
+
+    if "структ" in stage.lower():
+        earned_nh = round(struct_nh_1st * qty, 2)
+    else:
+        earned_nh = round(paint_nh_1st * qty, 2)
+
+    report_date = data.get("report_date", datetime.datetime.now().strftime("%d.%m.%Y"))
+
+    await asyncio.to_thread(
+        add_report, 
+        report_date, 
+        user_fio, 
+        data['plane'], 
+        data['part'], 
+        stage, 
+        qty, 
+        earned_nh, 
+        data['desc'], 
+        data.get('photo', '—')
+    )
+    
+    if new_status != "Не менять":
+        await asyncio.to_thread(update_part_status, data['plane'], data['part'], new_status)
+    
+    total_daily_nh = await asyncio.to_thread(calculate_daily_hours, user_fio, report_date)
+    
+    is_admin = user_data.get("role") in ["Руководитель", "Админ"] if user_data else False
+    await state.clear()
+    
+    congrat_msg = (
+        f"✅ **Отчет успешно сохранен!**\n\n"
+        f"⏱ За эту работу зачислено: **{earned_nh} н/ч** ({qty} шт.)\n"
+        f"🥳 **Ура, ты молодец!** Всего за **{report_date}** у тебя: **{total_daily_nh} н/ч**! 🎉"
+    )
+    
+    await callback.message.answer(congrat_msg, reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
     await callback.answer()
 
 
@@ -323,7 +592,8 @@ async def admin_show_user_reports(callback: CallbackQuery):
     
     text = f"📋 **Последние отчеты сотрудника {fio}:**\n\n"
     for r in reports[-10:]:
-        text += f"📅 `{r.get('Дата и время')}` | Борт: **{r.get('Бортовой номер')}**\n⚙ Деталь: {r.get('Деталь / Узел')}\n📌 Этап: {r.get('Выполненный этап')}\n💬 {r.get('Описание работ')}\n\n"
+        nh_val = r.get('Заработано Н/ч', 0)
+        text += f"📅 `{r.get('Дата и время')}` | Борт: **{r.get('Бортовой номер')}**\n⚙ Деталь: {r.get('Деталь / Узел')} ({r.get('Количество', 1)} шт.)\n⏱ Заработано: **{nh_val} н/ч**\n📌 Этап: {r.get('Выполненный этап')}\n💬 {r.get('Описание работ')}\n\n"
     
     await callback.message.answer(text, parse_mode="Markdown")
     await callback.answer()
@@ -340,156 +610,6 @@ async def admin_summary_planes(callback: CallbackQuery):
         text += f"✈ **Борт {p}:** всего деталей: {total} | ✅ Готово: {done} | 🔄 В работе: {in_prog}\n"
     
     await callback.message.answer(text, parse_mode="Markdown")
-    await callback.answer()
-
-
-# --- РАЗДЕЛ СПЕЦИФИКАЦИЙ ПО БОРТУ ---
-@router.message(F.text == "✈ План и краски по борту")
-async def show_planes_list(message: Message):
-    planes = await asyncio.to_thread(get_planes)
-    if not planes:
-        await message.answer("В таблице `План_и_Спецификации` нет занесенных самолетов.")
-        return
-    builder = [[InlineKeyboardButton(text=f"✈ Борт {p}", callback_data=f"info_plane:{p}")] for p in planes]
-    await message.answer("Выберите бортовой номер самолета:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
-
-@router.callback_query(F.data.startswith("info_plane:"))
-async def process_plane_info(callback: CallbackQuery):
-    plane_num = callback.data.split(":")[1]
-    specs = await asyncio.to_thread(get_plane_specs, plane_num)
-    
-    if not specs:
-        await callback.message.answer(f"По борту **{plane_num}** нет сохраненных деталей.", parse_mode="Markdown")
-        await callback.answer()
-        return
-
-    header = f"✈ **Спецификации по борту {plane_num}:**\n\n"
-    current_msg = header
-    messages = []
-    
-    for idx, item in enumerate(specs, start=1):
-        part_name = str(item.get('Деталь / Узел') or '—').strip()
-        paint = str(item.get('Номер / Марка краски') or '—').strip()
-        primer = str(item.get('Грунт / Подготовка') or '—').strip()
-        deadline = str(item.get('Срок сдачи (Дедлайн)') or '—').strip()
-        status = str(item.get('Текущий статус') or 'Не указан').strip()
-
-        item_text = (
-            f"**{idx}. {part_name}**\n"
-            f"🎨 Краска: `{paint}`\n"
-            f"🧪 Грунт: `{primer}`\n"
-            f"📅 Сдать до: **{deadline}**\n"
-            f"📌 Статус: *{status}*\n\n"
-        )
-        
-        if len(current_msg) + len(item_text) > 3500:
-            messages.append(current_msg)
-            current_msg = f"✈ **Спецификации по борту {plane_num} (продолжение):**\n\n" + item_text
-        else:
-            current_msg += item_text
-            
-    if current_msg:
-        messages.append(current_msg)
-        
-    for msg in messages:
-        await callback.message.answer(msg, parse_mode="Markdown")
-        
-    await callback.answer()
-
-
-# --- РАЗДЕЛ СДАЧИ ОТЧЕТОВ ---
-@router.message(F.text == "📝 Сдать отчет")
-async def start_report(message: Message, state: FSMContext):
-    planes = await asyncio.to_thread(get_planes)
-    if not planes:
-        await message.answer("В плане нет активных самолетов.")
-        return
-    builder = [[InlineKeyboardButton(text=f"✈ {p}", callback_data=f"rep_plane:{p}")] for p in planes]
-    await message.answer("Выберите бортовой номер:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
-    await state.set_state(ReportForm.select_plane)
-
-@router.callback_query(ReportForm.select_plane, F.data.startswith("rep_plane:"))
-async def process_rep_plane(callback: CallbackQuery, state: FSMContext):
-    plane_num = callback.data.split(":")[1]
-    
-    parts = await asyncio.to_thread(get_parts_for_plane, plane_num)
-    await state.update_data(plane=plane_num, parts_list=parts)
-    
-    builder = [
-        [InlineKeyboardButton(text=f"🔧 {part}", callback_data=f"rep_part:{i}")] 
-        for i, part in enumerate(parts)
-    ]
-    
-    await callback.message.answer(
-        "Выберите деталь / узел:", 
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=builder)
-    )
-    await state.set_state(ReportForm.select_part)
-    await callback.answer()
-
-@router.callback_query(ReportForm.select_part, F.data.startswith("rep_part:"))
-async def process_rep_part(callback: CallbackQuery, state: FSMContext):
-    part_idx = int(callback.data.split(":")[1])
-    
-    user_data = await state.get_data()
-    parts_list = user_data.get("parts_list", [])
-    selected_part = parts_list[part_idx] if part_idx < len(parts_list) else "Деталь"
-    
-    await state.update_data(part=selected_part)
-    
-    stages = ["Готово", "Структурный ремонт"]
-    builder = [[KeyboardButton(text=st)] for st in stages]
-    await callback.message.answer(
-        f"Выбрана деталь: {selected_part}\nВыберите выполненный этап:", 
-        reply_markup=ReplyKeyboardMarkup(keyboard=builder, resize_keyboard=True)
-    )
-    await state.set_state(ReportForm.select_stage)
-    await callback.answer()
-
-@router.message(ReportForm.select_stage)
-async def process_rep_stage(message: Message, state: FSMContext):
-    await state.update_data(stage=message.text.strip())
-    await message.answer("Напишите краткое описание выполненных работ:", reply_markup=ReplyKeyboardRemove())
-    await state.set_state(ReportForm.enter_desc)
-
-@router.message(ReportForm.enter_desc)
-async def process_rep_desc(message: Message, state: FSMContext):
-    await state.update_data(desc=message.text.strip())
-    kb = [[InlineKeyboardButton(text="Пропустить фото ⏩", callback_data="skip_photo")]]
-    await message.answer("Прикрепите фото работы (или нажмите 'Пропустить'):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    await state.set_state(ReportForm.send_photo)
-
-@router.callback_query(ReportForm.send_photo, F.data == "skip_photo")
-async def process_skip_photo(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(photo="—")
-    await ask_status_update(callback.message, state)
-    await callback.answer()
-
-@router.message(ReportForm.send_photo, F.photo)
-async def process_rep_photo(message: Message, state: FSMContext):
-    await state.update_data(photo=message.photo[-1].file_id)
-    await ask_status_update(message, state)
-
-async def ask_status_update(message: Message, state: FSMContext):
-    statuses = ["В работе", "На сушке", "Готово", "Не менять"]
-    builder = [[InlineKeyboardButton(text=s, callback_data=f"set_st:{s}")] for s in statuses]
-    await message.answer("Изменить текущий статус детали в плане?", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
-    await state.set_state(ReportForm.update_status)
-
-@router.callback_query(ReportForm.update_status, F.data.startswith("set_st:"))
-async def process_finish_report(callback: CallbackQuery, state: FSMContext):
-    new_status = callback.data.split(":")[1]
-    data = await state.get_data()
-    user_data = await asyncio.to_thread(get_user_data, callback.from_user.id)
-    user_fio = user_data["fio"] if user_data else f"ID: {callback.from_user.id}"
-
-    await asyncio.to_thread(add_report, user_fio, data['plane'], data['part'], data['stage'], data['desc'], data.get('photo', '—'))
-    if new_status != "Не менять":
-        await asyncio-to_thread(update_part_status, data['plane'], data['part'], new_status)
-    
-    is_admin = user_data.get("role") in ["Руководитель", "Админ"] if user_data else False
-    await state.clear()
-    await callback.message.answer("✅ **Отчет успешно сохранен!**", reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
     await callback.answer()
 
 
