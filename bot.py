@@ -99,7 +99,6 @@ def get_user_reports_with_row(fio):
     if len(rows) < 2:
         return []
     
-    header = rows[0]
     user_reports = []
     for idx, r in enumerate(rows[1:], start=2):
         if len(r) >= 7:
@@ -120,7 +119,7 @@ def get_user_reports_with_row(fio):
     return user_reports
 
 
-# --- ФУНКЦИИ ПОИСКА ТМЦ ---
+# --- УМНЫЕ ФУНКЦИИ ПОИСКА И ОПРЕДЕЛЕНИЯ СТОЛБЦОВ ТМЦ ---
 def search_tmc_items(query):
     sh = get_tmc_sheet()
     results = []
@@ -131,15 +130,35 @@ def search_tmc_items(query):
         if len(rows) < 2:
             continue
         
+        # Определяем нужный столбец с P/N по заголовкам первой строки
+        header = [str(c).lower().strip() for c in rows[0]]
+        pn_col = 0
+        for idx, cell in enumerate(header):
+            if "p/n" in cell or "партийного" in cell:
+                pn_col = idx
+                break
+        else:
+            if ws.title.strip().lower() != "краски":
+                pn_col = 1
+
+        name_col = pn_col + 1
+        chars_col = pn_col + 2
+        qty_col = pn_col + 3
+        store_col = pn_col + 4
+        comment_col = 11 if pn_col == 0 else 12
+
         for r in rows[1:]:
             if not any(r): 
                 continue
-            pn = r[0] if len(r) > 0 else ""
-            name = r[1] if len(r) > 1 else ""
-            chars = r[2] if len(r) > 2 else ""
-            qty = r[3] if len(r) > 3 else ""
-            store = r[4] if len(r) > 4 else ""
-            comment = r[11] if len(r) > 11 else ""
+            pn = r[pn_col] if len(r) > pn_col else ""
+            if not pn or pn.lower() in ["p/n", "название", "№", "грунты", "лаки", "спирты", "растворители", "структурные эмали"]:
+                continue
+            
+            name = r[name_col] if len(r) > name_col else ""
+            chars = r[chars_col] if len(r) > chars_col else ""
+            qty = r[qty_col] if len(r) > qty_col else ""
+            store = r[store_col] if len(r) > store_col else ""
+            comment = r[comment_col] if len(r) > comment_col else ""
             
             full_str = f"{pn} {name} {chars} {store} {comment}".lower()
             
@@ -299,20 +318,32 @@ async def tmc_show_category_items(callback: CallbackQuery):
         await callback.answer()
         return
     
+    # Автоопределение нужного столбца для P/N
+    header_row = [str(c).lower().strip() for c in rows[0]]
+    pn_col = 0
+    for idx, cell in enumerate(header_row):
+        if "p/n" in cell or "партийного" in cell:
+            pn_col = idx
+            break
+    else:
+        if cat_name.strip().lower() != "краски":
+            pn_col = 1
+
     pn_list = []
     for r in rows[1:]:
-        if r and len(r) > 0:
-            val = str(r[0]).strip()
-            if val:
+        if r and len(r) > pn_col:
+            val = str(r[pn_col]).strip()
+            # Фильтруем пустые элементы и подзаголовки
+            if val and val.lower() not in ["№", "p/n (название партийного номера)", "p/n", "грунты", "лаки", "спирты", "растворители", "структурные эмали"]:
                 pn_list.append(val)
                 
     if not pn_list:
-        await callback.message.answer(f"В категории **{cat_name}** нет заполненных P/N в столбце A.", parse_mode="Markdown")
+        await callback.message.answer(f"В категории **{cat_name}** нет заполненных P/N.", parse_mode="Markdown")
         await callback.answer()
         return
     
-    header = f"📂 **Все P/N в категории «{cat_name}» (всего {len(pn_list)} шт.):**\n\n"
-    current_msg = header
+    header_text = f"📂 **Все P/N в категории «{cat_name}» (всего {len(pn_list)} шт.):**\n\n"
+    current_msg = header_text
     messages = []
     
     for idx, pn in enumerate(pn_list, start=1):
@@ -387,7 +418,7 @@ async def process_plane_info(callback: CallbackQuery):
     await callback.answer()
 
 
-# --- РАЗДЕЛ СДАЧИ ОТЧЕТОВ (С ПОДДЕРЖКОЙ МНОГОКРАТНОГО ВВОДА) ---
+# --- РАЗДЕЛ СДАЧИ ОТЧЕТОВ ---
 @router.message(F.text == "📝 Сдать отчет")
 async def start_report(message: Message, state: FSMContext):
     today = datetime.datetime.now().strftime("%d.%m.%Y")
@@ -550,7 +581,7 @@ async def process_add_item_to_batch(callback: CallbackQuery, state: FSMContext):
     qty = data.get("qty", 1)
     
     # Расчет норма-часов
-    struct_nh_1st = parse_float(spec.get("Н/ч Структ. ремонт, за 1 шт.") or spec.get("Н/ч Структ. ремонт"))
+    struct_nh_1st = parse_float(spec.get("Н/ч Сtruкт. ремонт, за 1 шт.") or spec.get("Н/ч Структ. ремонт"))
     paint_nh_1st = parse_float(spec.get("Н/ч Покраска за 1 шт.") or spec.get("Н/ч Покраска"))
     nh_per_1 = parse_float(spec.get("Н/ч на 1 изд.") or spec.get("Н/ч на 1 шт."))
     
@@ -574,7 +605,7 @@ async def process_add_item_to_batch(callback: CallbackQuery, state: FSMContext):
 
     report_date = data.get("report_date", datetime.datetime.now().strftime("%d.%m.%Y"))
 
-    # Сохраняем строку в Google Таблицу сразу
+    # Сохраняем строку в Google Таблицу
     await asyncio.to_thread(
         add_report, 
         report_date, 
@@ -591,7 +622,6 @@ async def process_add_item_to_batch(callback: CallbackQuery, state: FSMContext):
     if new_status != "Не менять":
         await asyncio.to_thread(update_part_status, data['plane'], data['part'], new_status)
     
-    # Записываем в сессию
     batch = data.get("batch_items", [])
     batch.append({"part": data['part'], "qty": qty, "earned_nh": earned_nh})
     await state.update_data(batch_items=batch)
@@ -642,7 +672,7 @@ async def process_batch_finish(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# --- РАЗДЕЛ "МОИ ОТЧЕТЫ" (ПРОСМОТР, РЕДАКТИРОВАНИЕ, УДАЛЕНИЕ) ---
+# --- РАЗДЕЛ "МОИ ОТЧЕТЫ" ---
 @router.message(F.text == "📋 Мои отчеты")
 async def show_my_reports(message: Message):
     user_data = await asyncio.to_thread(get_user_data, message.from_user.id)
@@ -713,11 +743,9 @@ async def process_apply_new_qty(message: Message, state: FSMContext):
         old_qty = parse_float(row_data[5])
         old_nh = parse_float(row_data[6])
         
-        # Перерасчет н/ч на штуку
         per_item_nh = (old_nh / old_qty) if old_qty > 0 else 0
         new_nh = round(per_item_nh * new_qty, 2)
         
-        # Обновляем количество и часы в Google Таблице
         await asyncio.to_thread(ws_reports.update_cell, row_idx, 6, new_qty)
         await asyncio.to_thread(ws_reports.update_cell, row_idx, 7, new_nh)
         
