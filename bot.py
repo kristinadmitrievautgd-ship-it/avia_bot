@@ -920,7 +920,7 @@ async def admin_summary_planes(callback: CallbackQuery):
     await callback.answer()
 
 
-# --- ВЕБ-СЕРВЕР ДЛЯ РЕНДЕРА И ВЕБХУКОВ ---
+# --- ВЕБ-СЕРВЕР ДЛЯ РЕНДЕРА И ВЕБХУКОВ (ФИКСОР ПОРТА 503) ---
 async def handle_ping(request):
     return web.Response(text="Bot is running")
 
@@ -929,7 +929,9 @@ async def main():
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
+    
+    # Строго считываем порт, который выделяет Render (или используем 10000)
+    port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     
