@@ -83,17 +83,12 @@ def get_reports_by_user(fio):
     return [r for r in records if str(r.get("ФИО Маляра")).strip().lower() == fio.strip().lower()]
 
 # --- ФУНКЦИИ ПОИСКА ТМЦ ---
-def search_tmc_items(query, category_name=None):
+def search_tmc_items(query):
     sh = get_tmc_sheet()
     results = []
-    query_lower = query.lower().strip() if query else ""
-    
-    if category_name:
-        worksheets = [sh.worksheet(category_name)]
-    else:
-        worksheets = sh.worksheets()
+    query_lower = query.lower().strip()
 
-    for ws in worksheets:
+    for ws in sh.worksheets():
         rows = ws.get_all_values()
         if len(rows) < 2:
             continue
@@ -110,7 +105,7 @@ def search_tmc_items(query, category_name=None):
             
             full_str = f"{pn} {name} {chars} {store} {comment}".lower()
             
-            if not query_lower or query_lower in full_str:
+            if query_lower in full_str:
                 results.append({
                     "category": ws.title,
                     "pn": pn or "Не указан",
@@ -120,10 +115,6 @@ def search_tmc_items(query, category_name=None):
                     "store": store or "—",
                     "comment": comment or ""
                 })
-                if len(results) >= 15 and query_lower:
-                    break
-        if len(results) >= 15 and query_lower:
-            break
 
     return results
 
@@ -189,16 +180,16 @@ async def show_profile(message: Message):
 
 # --- РАЗДЕЛ ПОИСКА ТМЦ ---
 @router.message(F.text == "📦 Поиск ТМЦ / P/N")
-async def start_tmc_search(message: Message, state: FSMContext):
+async def start_tmc_search(message: Message):
     kb = [
-        [InlineKeyboardButton(text="🔎 Текстовый поиск / по P/N", callback_data="tmc_mode_text")],
-        [InlineKeyboardButton(text="📁 Обзор по категориям (вкладкам)", callback_data="tmc_mode_cats")]
+        [InlineKeyboardButton(text="🔎 Текстовый поиск по слову / P/N", callback_data="tmc_mode_text")],
+        [InlineKeyboardButton(text="📁 Показать все P/N по категориям", callback_data="tmc_mode_cats")]
     ]
-    await message.answer("📦 **Раздел ТМЦ и Расходных материалов**\n\nКак вы хотите выполнить поиск?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    await message.answer("📦 **Раздел ТМЦ и Расходных материалов**\n\nВыберите способ просмотра:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
 
 @router.callback_query(F.data == "tmc_mode_text")
 async def tmc_prompt_text(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите название материала, партийный номер (P/N) или марку (например: *cockpit*, *профколор*, *аэрозольная*):")
+    await callback.message.answer("Введите слово для поиска, P/N или марку (например: *cockpit*, *профколор*, *аэрозольная*):")
     await state.set_state(TMCSearchState.waiting_for_query)
     await callback.answer()
 
@@ -214,49 +205,86 @@ async def process_tmc_text_query(message: Message, state: FSMContext):
         await message.answer("❌ Ничего не найдено по вашему запросу.")
         return
     
-    text = f"📋 **Найдено совпадений ({len(results)}):**\n\n"
+    header = f"📋 **Найдено совпадений по запросу «{query}» ({len(results)}):**\n\n"
+    current_msg = header
+    messages = []
+    
     for item in results:
-        text += (
+        item_text = (
             f"🏷 **P/N:** `{item['pn']}`\n"
             f"📁 Категория: *{item['category']}*\n"
             f"📦 Наименование: {item['name']}\n"
             f"⚙ Характеристики: `{item['chars']}`\n"
-            f"🛒 Магазин/Ссылка: {item['store']}\n"
+            f"🛒 Магазин: {item['store']}\n"
         )
         if item['comment']:
-            text += f"💬 Комментарий: {item['comment']}\n"
-        text += "───────────────\n"
+            item_text += f"💬 Комментарий: {item['comment']}\n"
+        item_text += "───────────────\n"
         
-    await message.answer(text, parse_mode="Markdown")
+        if len(current_msg) + len(item_text) > 3500:
+            messages.append(current_msg)
+            current_msg = f"📋 **Результаты поиска (продолжение):**\n\n" + item_text
+        else:
+            current_msg += item_text
+            
+    if current_msg:
+        messages.append(current_msg)
+        
+    for msg in messages:
+        await message.answer(msg, parse_mode="Markdown")
 
 @router.callback_query(F.data == "tmc_mode_cats")
 async def tmc_show_categories(callback: CallbackQuery):
     cats = await asyncio.to_thread(get_tmc_categories_list)
     builder = [[InlineKeyboardButton(text=f"📁 {c}", callback_data=f"tmc_cat:{c}")] for c in cats]
-    await callback.message.answer("Выберите категорию ТМЦ:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
+    await callback.message.answer("Выберите категорию (вкладку) для вывода всех P/N:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
     await callback.answer()
 
 @router.callback_query(F.data.startswith("tmc_cat:"))
 async def tmc_show_category_items(callback: CallbackQuery):
     cat_name = callback.data.split(":", 1)[1]
-    results = await asyncio.to_thread(search_tmc_items, None, cat_name)
     
-    if not results:
+    sh = await asyncio.to_thread(get_tmc_sheet)
+    ws = await asyncio.to_thread(sh.worksheet, cat_name)
+    rows = await asyncio.to_thread(ws.get_all_values)
+    
+    if len(rows) < 2:
         await callback.message.answer(f"В категории **{cat_name}** пока нет записей.", parse_mode="Markdown")
         await callback.answer()
         return
     
-    text = f"📂 **Материалы в категории «{cat_name}» (показаны первые {min(len(results), 15)}):**\n\n"
-    for item in results[:15]:
-        text += (
-            f"🏷 **P/N:** `{item['pn']}`\n"
-            f"📦 Наименование: {item['name']}\n"
-            f"⚙ Характеристики: `{item['chars']}`\n"
-            f"🛒 Магазин: {item['store']}\n"
-            f"───────────────\n"
-        )
+    # Берем ВСЕ элементы только из Столбца A (пропуская первую строку-заголовок)
+    pn_list = []
+    for r in rows[1:]:
+        if r and len(r) > 0:
+            val = str(r[0]).strip()
+            if val:
+                pn_list.append(val)
+                
+    if not pn_list:
+        await callback.message.answer(f"В категории **{cat_name}** нет заполненных P/N в столбце A.", parse_mode="Markdown")
+        await callback.answer()
+        return
     
-    await callback.message.answer(text, parse_mode="Markdown")
+    header = f"📂 **Все P/N в категории «{cat_name}» (всего {len(pn_list)} шт.):**\n\n"
+    current_msg = header
+    messages = []
+    
+    for idx, pn in enumerate(pn_list, start=1):
+        item_text = f"{idx}. `{pn}`\n"
+        
+        if len(current_msg) + len(item_text) > 3500:
+            messages.append(current_msg)
+            current_msg = f"📂 **Все P/N в категории «{cat_name}» (продолжение):**\n\n" + item_text
+        else:
+            current_msg += item_text
+            
+    if current_msg:
+        messages.append(current_msg)
+        
+    for msg in messages:
+        await callback.message.answer(msg, parse_mode="Markdown")
+        
     await callback.answer()
 
 
@@ -457,7 +485,7 @@ async def process_finish_report(callback: CallbackQuery, state: FSMContext):
 
     await asyncio.to_thread(add_report, user_fio, data['plane'], data['part'], data['stage'], data['desc'], data.get('photo', '—'))
     if new_status != "Не менять":
-        await asyncio.to_thread(update_part_status, data['plane'], data['part'], new_status)
+        await asyncio-to_thread(update_part_status, data['plane'], data['part'], new_status)
     
     is_admin = user_data.get("role") in ["Руководитель", "Админ"] if user_data else False
     await state.clear()
