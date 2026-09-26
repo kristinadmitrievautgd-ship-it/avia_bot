@@ -65,7 +65,7 @@ def parse_float(val):
         if not val:
             return 0.0
         return float(str(val).replace(',', '.').strip())
-    except ValueError:
+    except (ValueError, TypeError):
         return 0.0
 
 def add_report(report_date, fio, plane, part, stage, qty, earned_hours, desc, photo_id="—"):
@@ -502,14 +502,13 @@ async def process_finish_report(callback: CallbackQuery, state: FSMContext):
     stage = data.get("stage", "")
     qty = data.get("qty", 1)
     
-    # --- ЛОГИКА РАСЧЕТА НОРМА-ЧАСОВ ---
+    # Расчет Норма-часов
     struct_nh_1st = parse_float(spec.get("Н/ч Структ. ремонт, за 1 шт.") or spec.get("Н/ч Структ. ремонт"))
     paint_nh_1st = parse_float(spec.get("Н/ч Покраска за 1 шт.") or spec.get("Н/ч Покраска"))
     nh_per_1 = parse_float(spec.get("Н/ч на 1 изд.") or spec.get("Н/ч на 1 шт."))
     nh_total = parse_float(spec.get("Н/ч общ.") or spec.get("Н/ч всего"))
     total_qty_in_plan = parse_float(spec.get("Кол-во в раб.") or spec.get("Количество") or spec.get("Кол-во"))
 
-    # Вычисление стоимости 1 шт., если нет прямого значения:
     if struct_nh_1st == 0 and paint_nh_1st == 0:
         if nh_per_1 > 0:
             struct_nh_1st = nh_per_1 * 0.60
