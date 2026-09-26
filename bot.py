@@ -106,7 +106,7 @@ def get_user_reports_with_row(fio):
             if row_fio == fio.strip().lower():
                 user_reports.append({
                     "row_idx": idx,
-                    "date": r[0],
+                    "date": str(r[0]).split()[0],
                     "fio": r[1],
                     "plane": r[2],
                     "part": r[3],
@@ -119,7 +119,7 @@ def get_user_reports_with_row(fio):
     return user_reports
 
 
-# --- УМНЫЕ ФУНКЦИИ ПОИСКА И ОПРЕДЕЛЕНИЯ СТОЛБЦОВ ТМЦ ---
+# --- ПОИСК ТМЦ ---
 def search_tmc_items(query):
     sh = get_tmc_sheet()
     results = []
@@ -130,7 +130,6 @@ def search_tmc_items(query):
         if len(rows) < 2:
             continue
         
-        # Определяем нужный столбец с P/N по заголовкам первой строки
         header = [str(c).lower().strip() for c in rows[0]]
         pn_col = 0
         for idx, cell in enumerate(header):
@@ -318,7 +317,6 @@ async def tmc_show_category_items(callback: CallbackQuery):
         await callback.answer()
         return
     
-    # Автоопределение нужного столбца для P/N
     header_row = [str(c).lower().strip() for c in rows[0]]
     pn_col = 0
     for idx, cell in enumerate(header_row):
@@ -333,7 +331,6 @@ async def tmc_show_category_items(callback: CallbackQuery):
     for r in rows[1:]:
         if r and len(r) > pn_col:
             val = str(r[pn_col]).strip()
-            # Фильтруем пустые элементы и подзаголовки
             if val and val.lower() not in ["№", "p/n (название партийного номера)", "p/n", "грунты", "лаки", "спирты", "растворители", "структурные эмали"]:
                 pn_list.append(val)
                 
@@ -580,8 +577,7 @@ async def process_add_item_to_batch(callback: CallbackQuery, state: FSMContext):
     stage = data.get("stage", "")
     qty = data.get("qty", 1)
     
-    # Расчет норма-часов
-    struct_nh_1st = parse_float(spec.get("Н/ч Сtruкт. ремонт, за 1 шт.") or spec.get("Н/ч Структ. ремонт"))
+    struct_nh_1st = parse_float(spec.get("Н/ч Структ. ремонт, за 1 шт.") or spec.get("Н/ч Структ. ремонт"))
     paint_nh_1st = parse_float(spec.get("Н/ч Покраска за 1 шт.") or spec.get("Н/ч Покраска"))
     nh_per_1 = parse_float(spec.get("Н/ч на 1 изд.") or spec.get("Н/ч на 1 шт."))
     
@@ -605,7 +601,6 @@ async def process_add_item_to_batch(callback: CallbackQuery, state: FSMContext):
 
     report_date = data.get("report_date", datetime.datetime.now().strftime("%d.%m.%Y"))
 
-    # Сохраняем строку в Google Таблицу
     await asyncio.to_thread(
         add_report, 
         report_date, 
@@ -776,34 +771,138 @@ async def admin_select_user_prompt(callback: CallbackQuery):
     users = [r.get("ФИО") for r in ws_users.get_all_records() if r.get("ФИО")]
     
     builder = [[InlineKeyboardButton(text=u, callback_data=f"adm_usr:{u}")] for u in users]
-    await callback.message.answer("Выберите сотрудника для просмотра истории отчетов:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
+    await callback.message.answer("Выберите сотрудника для просмотра отчета:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
     await callback.answer()
 
 @router.callback_query(F.data.startswith("adm_usr:"))
-async def admin_show_user_reports(callback: CallbackQuery):
+async def admin_select_period(callback: CallbackQuery):
     fio = callback.data.split(":")[1]
-    reports = await asyncio.to_thread(get_user_reports_with_row, fio)
     
-    if not reports:
-        await callback.message.answer(f"У сотрудника {fio} пока нет сданных отчетов.")
+    kb = [
+        [InlineKeyboardButton(text="📅 За сегодня", callback_data=f"adm_p:today:{fio}")],
+        [InlineKeyboardButton(text="🗓 За 7 дней", callback_data=f"adm_p:7days:{fio}")],
+        [InlineKeyboardButton(text="📊 За этот месяц", callback_data=f"adm_p:month:{fio}")],
+        [InlineKeyboardButton(text="📁 Все отчеты", callback_data=f"adm_p:all:{fio}")]
+    ]
+    await callback.message.answer(f"Выберите период для **{fio}**:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("adm_p:"))
+async def admin_show_user_summary(callback: CallbackQuery):
+    parts = callback.data.split(":", 2)
+    period_type = parts[1]
+    fio = parts[2]
+    
+    all_reports = await asyncio.to_thread(get_user_reports_with_row, fio)
+    
+    if not all_reports:
+        await callback.message.answer(f"У сотрудника **{fio}** нет сданных отчетов.", parse_mode="Markdown")
         await callback.answer()
         return
+
+    today_dt = datetime.datetime.now().date()
+    filtered_reports = []
+
+    for r in all_reports:
+        try:
+            r_dt = datetime.datetime.strptime(r['date'], "%d.%m.%Y").date()
+        except ValueError:
+            r_dt = today_dt
+
+        if period_type == "today" and r_dt == today_dt:
+            filtered_reports.append(r)
+        elif period_type == "7days" and (today_dt - r_dt).days <= 7:
+            filtered_reports.append(r)
+        elif period_type == "month" and r_dt.month == today_dt.month and r_dt.year == today_dt.year:
+            filtered_reports.append(r)
+        elif period_type == "all":
+            filtered_reports.append(r)
+
+    if not filtered_reports:
+        await callback.message.answer(f"У сотрудника **{fio}** нет отчетов за выбранный период.", parse_mode="Markdown")
+        await callback.answer()
+        return
+
+    total_nh = round(sum(r['earned_nh'] for r in filtered_reports), 2)
+    total_qty = int(sum(r['qty'] for r in filtered_reports))
     
-    await callback.message.answer(f"📋 **Последние отчеты сотрудника {fio}:**", parse_mode="Markdown")
-    for r in reports[-10:]:
-        text = (
-            f"📅 `{r['date']}` | Борт: **{r['plane']}**\n"
-            f"⚙ Деталь: {r['part']} ({r['qty']} шт.)\n"
-            f"⏱ Заработано: **{r['earned_nh']} н/ч**\n"
-            f"📌 Этап: {r['stage']}\n💬 {r['desc']}\n"
-        )
-        await callback.message.answer(text, parse_mode="Markdown")
-        if r['photo'] and r['photo'] != "—":
+    grouped = {}
+    for r in filtered_reports:
+        d = r['date']
+        if d not in grouped:
+            grouped[d] = []
+        grouped[d].append(r)
+
+    header = (
+        f"📊 **СВОДНЫЙ ОТЧЕТ СОТРУДНИКА**\n"
+        f"👤 **{fio}**\n\n"
+        f"⏱ Всего наработано: **{total_nh} н/ч**\n"
+        f"📦 Сдано элементов: **{total_qty} шт.**\n"
+        f"───────────────────\n\n"
+    )
+
+    current_msg = header
+    messages = []
+    photos_list = []
+
+    for d, items in grouped.items():
+        day_nh = round(sum(i['earned_nh'] for i in items), 2)
+        day_block = f"📅 **{d}** *(итого {day_nh} н/ч)*:\n"
+        
+        for item in items:
+            day_block += f"• ✈ **{item['plane']}** | {item['part']} (`{int(item['qty'])} шт.` | *{item['stage']}*) — **{item['earned_nh']} н/ч**\n"
+            if item['photo'] and item['photo'] != "—":
+                photos_list.append((d, item['part'], item['photo']))
+        
+        day_block += "\n"
+
+        if len(current_msg) + len(day_block) > 3500:
+            messages.append(current_msg)
+            current_msg = f"📊 **Сводный отчет {fio} (продолжение):**\n\n" + day_block
+        else:
+            current_msg += day_block
+
+    if current_msg:
+        messages.append(current_msg)
+
+    for idx, msg in enumerate(messages):
+        kb = None
+        if idx == len(messages) - 1 and photos_list:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"📸 Показать фото ({len(photos_list)} шт.)", callback_data=f"show_ph:{fio}:{period_type}")]])
+        await callback.message.answer(msg, reply_markup=kb, parse_mode="Markdown")
+
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("show_ph:"))
+async def admin_show_photos(callback: CallbackQuery):
+    parts = callback.data.split(":", 2)
+    period_type = parts[1]
+    fio = parts[2]
+    
+    all_reports = await asyncio.to_thread(get_user_reports_with_row, fio)
+    today_dt = datetime.datetime.now().date()
+    
+    await callback.message.answer(f"📸 **Загружаю фотографии отчетов {fio}...**", parse_mode="Markdown")
+    
+    for r in all_reports:
+        try:
+            r_dt = datetime.datetime.strptime(r['date'], "%d.%m.%Y").date()
+        except ValueError:
+            r_dt = today_dt
+
+        match = False
+        if period_type == "today" and r_dt == today_dt: match = True
+        elif period_type == "7days" and (today_dt - r_dt).days <= 7: match = True
+        elif period_type == "month" and r_dt.month == today_dt.month and r_dt.year == today_dt.year: match = True
+        elif period_type == "all": match = True
+
+        if match and r['photo'] and r['photo'] != "—":
             try:
-                await callback.message.answer_photo(r['photo'], caption=f"📸 Фото к отчету {fio}")
+                caption = f"📅 `{r['date']}` | Борт **{r['plane']}**\n🔧 {r['part']} ({int(r['qty'])} шт.)"
+                await callback.message.answer_photo(r['photo'], caption=caption, parse_mode="Markdown")
             except Exception:
                 pass
-        
+
     await callback.answer()
 
 @router.callback_query(F.data == "admin_summary_planes")
