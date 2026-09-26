@@ -26,6 +26,7 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
+# --- РАБОТА С GOOGLE TABLES ---
 def get_sheets():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
@@ -92,10 +93,31 @@ def update_part_status(plane, part, new_status):
             ws_plan.update_cell(idx, 6, new_status)
             break
 
-def get_reports_by_user(fio):
+def get_user_reports_with_row(fio):
     _, ws_reports, _ = get_sheets()
-    records = ws_reports.get_all_records()
-    return [r for r in records if str(r.get("ФИО Маляра", "")).strip().lower() == fio.strip().lower()]
+    rows = ws_reports.get_all_values()
+    if len(rows) < 2:
+        return []
+    
+    header = rows[0]
+    user_reports = []
+    for idx, r in enumerate(rows[1:], start=2):
+        if len(r) >= 7:
+            row_fio = str(r[1]).strip().lower()
+            if row_fio == fio.strip().lower():
+                user_reports.append({
+                    "row_idx": idx,
+                    "date": r[0],
+                    "fio": r[1],
+                    "plane": r[2],
+                    "part": r[3],
+                    "stage": r[4],
+                    "qty": parse_float(r[5]),
+                    "earned_nh": parse_float(r[6]),
+                    "desc": r[7] if len(r) > 7 else "",
+                    "photo": r[8] if len(r) > 8 else "—"
+                })
+    return user_reports
 
 
 # --- ФУНКЦИИ ПОИСКА ТМЦ ---
@@ -153,6 +175,10 @@ class ReportForm(StatesGroup):
     enter_desc = State()
     send_photo = State()
     update_status = State()
+    batch_action = State()
+
+class EditReportState(StatesGroup):
+    waiting_new_qty = State()
 
 class TMCSearchState(StatesGroup):
     waiting_for_query = State()
@@ -162,7 +188,8 @@ class TMCSearchState(StatesGroup):
 def main_menu_keyboard(is_admin=False):
     kb = [
         [KeyboardButton(text="✈ План и краски по борту"), KeyboardButton(text="📦 Поиск ТМЦ / P/N")],
-        [KeyboardButton(text="📝 Сдать отчет"), KeyboardButton(text="👤 Мой профиль")]
+        [KeyboardButton(text="📝 Сдать отчет"), KeyboardButton(text="📋 Мои отчеты")],
+        [KeyboardButton(text="👤 Мой профиль")]
     ]
     if is_admin:
         kb.append([KeyboardButton(text="👔 Панель руководителя")])
@@ -360,7 +387,7 @@ async def process_plane_info(callback: CallbackQuery):
     await callback.answer()
 
 
-# --- РАЗДЕЛ СДАЧИ ОТЧЕТОВ С ВЫБОРОМ ДАТЫ И РАСЧЕТОМ НОРМА-ЧАСОВ ---
+# --- РАЗДЕЛ СДАЧИ ОТЧЕТОВ (С ПОДДЕРЖКОЙ МНОГОКРАТНОГО ВВОДА) ---
 @router.message(F.text == "📝 Сдать отчет")
 async def start_report(message: Message, state: FSMContext):
     today = datetime.datetime.now().strftime("%d.%m.%Y")
@@ -385,7 +412,7 @@ async def process_custom_date(message: Message, state: FSMContext):
     date_text = message.text.strip()
     try:
         valid_date = datetime.datetime.strptime(date_text, "%d.%m.%Y").strftime("%d.%m.%Y")
-        await state.update_data(report_date=valid_date)
+        await state.update_data(report_date=valid_date, batch_items=[])
         await ask_plane_for_report(message, state)
     except ValueError:
         await message.answer("❌ Неверный формат даты. Пожалуйста, введите дату в формате **ДД.ММ.ГГГГ** (например: `25.09.2026`):")
@@ -393,7 +420,7 @@ async def process_custom_date(message: Message, state: FSMContext):
 @router.callback_query(ReportForm.select_date, F.data.startswith("rep_date:"))
 async def process_date_choice(callback: CallbackQuery, state: FSMContext):
     selected_date = callback.data.split(":", 1)[1]
-    await state.update_data(report_date=selected_date)
+    await state.update_data(report_date=selected_date, batch_items=[])
     await ask_plane_for_report(callback.message, state)
     await callback.answer()
 
@@ -403,7 +430,7 @@ async def ask_plane_for_report(message: Message, state: FSMContext):
         await message.answer("В плане нет активных самолетов.")
         return
     builder = [[InlineKeyboardButton(text=f"✈ {p}", callback_data=f"rep_plane:{p}")] for p in planes]
-    await message.answer("Выберите бортовой номер:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
+    await message.answer("Выберите бортовой номер самолета:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
     await state.set_state(ReportForm.select_plane)
 
 @router.callback_query(ReportForm.select_plane, F.data.startswith("rep_plane:"))
@@ -449,22 +476,42 @@ async def process_rep_stage(message: Message, state: FSMContext):
     stage = message.text.strip()
     await state.update_data(stage=stage)
     
+    user_data = await state.get_data()
+    spec = user_data.get("selected_spec", {})
+    
+    total_in_plan = int(parse_float(spec.get("Кол-во в раб.") or spec.get("Количество") or spec.get("Кол-во") or 24))
+    
     builder = [
-        [InlineKeyboardButton(text="1 шт", callback_data="qty:1"), InlineKeyboardButton(text="2 шт", callback_data="qty:2")],
-        [InlineKeyboardButton(text="3 шт", callback_data="qty:3"), InlineKeyboardButton(text="4 шт", callback_data="qty:4")],
-        [InlineKeyboardButton(text="5 шт", callback_data="qty:5"), InlineKeyboardButton(text="6 шт", callback_data="qty:6")]
+        [InlineKeyboardButton(text="1 шт", callback_data="qty:1"), InlineKeyboardButton(text="2 шт", callback_data="qty:2"), InlineKeyboardButton(text="5 шт", callback_data="qty:5")],
+        [InlineKeyboardButton(text="10 шт", callback_data="qty:10"), InlineKeyboardButton(text="12 шт", callback_data="qty:12"), InlineKeyboardButton(text=f"Все ({total_in_plan} шт)", callback_data=f"qty:{total_in_plan}")]
     ]
-    await message.answer("Укажите количество обработанных штук:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
+    
+    await message.answer(
+        f"Укажите количество обработанных штук (выберите кнопку или **напишите число текстом**):", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=builder),
+        parse_mode="Markdown"
+    )
     await state.set_state(ReportForm.select_qty)
 
 @router.callback_query(ReportForm.select_qty, F.data.startswith("qty:"))
-async def process_rep_qty(callback: CallbackQuery, state: FSMContext):
+async def process_rep_qty_callback(callback: CallbackQuery, state: FSMContext):
     qty = int(callback.data.split(":")[1])
     await state.update_data(qty=qty)
-    
     await callback.message.answer("Напишите краткое описание выполненных работ:", reply_markup=ReplyKeyboardRemove())
     await state.set_state(ReportForm.enter_desc)
     await callback.answer()
+
+@router.message(ReportForm.select_qty)
+async def process_rep_qty_text(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if not text.isdigit() or int(text) <= 0:
+        await message.answer("Пожалуйста, введите целое положительное число штук (например: `12`):", parse_mode="Markdown")
+        return
+    
+    qty = int(text)
+    await state.update_data(qty=qty)
+    await message.answer("Напишите краткое описание выполненных работ:", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(ReportForm.enter_desc)
 
 @router.message(ReportForm.enter_desc)
 async def process_rep_desc(message: Message, state: FSMContext):
@@ -491,7 +538,7 @@ async def ask_status_update(message: Message, state: FSMContext):
     await state.set_state(ReportForm.update_status)
 
 @router.callback_query(ReportForm.update_status, F.data.startswith("set_st:"))
-async def process_finish_report(callback: CallbackQuery, state: FSMContext):
+async def process_add_item_to_batch(callback: CallbackQuery, state: FSMContext):
     new_status = callback.data.split(":")[1]
     data = await state.get_data()
     
@@ -502,29 +549,32 @@ async def process_finish_report(callback: CallbackQuery, state: FSMContext):
     stage = data.get("stage", "")
     qty = data.get("qty", 1)
     
-    # Расчет Норма-часов
+    # Расчет норма-часов
     struct_nh_1st = parse_float(spec.get("Н/ч Структ. ремонт, за 1 шт.") or spec.get("Н/ч Структ. ремонт"))
     paint_nh_1st = parse_float(spec.get("Н/ч Покраска за 1 шт.") or spec.get("Н/ч Покраска"))
     nh_per_1 = parse_float(spec.get("Н/ч на 1 изд.") or spec.get("Н/ч на 1 шт."))
+    
     nh_total = parse_float(spec.get("Н/ч общ.") or spec.get("Н/ч всего"))
     total_qty_in_plan = parse_float(spec.get("Кол-во в раб.") or spec.get("Количество") or spec.get("Кол-во"))
 
-    if struct_nh_1st == 0 and paint_nh_1st == 0:
-        if nh_per_1 > 0:
-            struct_nh_1st = nh_per_1 * 0.60
-            paint_nh_1st = nh_per_1 * 0.40
-        elif nh_total > 0 and total_qty_in_plan > 0:
-            per_item = nh_total / total_qty_in_plan
-            struct_nh_1st = per_item * 0.60
-            paint_nh_1st = per_item * 0.40
+    if nh_per_1 == 0 and nh_total > 0 and total_qty_in_plan > 0:
+        nh_per_1 = nh_total / total_qty_in_plan
+
+    if struct_nh_1st == 0:
+        struct_nh_1st = nh_per_1 * 0.60
+    if paint_nh_1st == 0:
+        paint_nh_1st = nh_per_1 * 0.40
 
     if "структ" in stage.lower():
         earned_nh = round(struct_nh_1st * qty, 2)
+    elif "готов" in stage.lower():
+        earned_nh = round(nh_per_1 * qty, 2)
     else:
         earned_nh = round(paint_nh_1st * qty, 2)
 
     report_date = data.get("report_date", datetime.datetime.now().strftime("%d.%m.%Y"))
 
+    # Сохраняем строку в Google Таблицу сразу
     await asyncio.to_thread(
         add_report, 
         report_date, 
@@ -541,19 +591,141 @@ async def process_finish_report(callback: CallbackQuery, state: FSMContext):
     if new_status != "Не менять":
         await asyncio.to_thread(update_part_status, data['plane'], data['part'], new_status)
     
+    # Записываем в сессию
+    batch = data.get("batch_items", [])
+    batch.append({"part": data['part'], "qty": qty, "earned_nh": earned_nh})
+    await state.update_data(batch_items=batch)
+    
+    kb = [
+        [InlineKeyboardButton(text="➕ Добавить еще деталь (за эту дату)", callback_data="batch_add_more")],
+        [InlineKeyboardButton(text="🏁 Завершить отчет и посчитать часы", callback_data="batch_finish")]
+    ]
+    
+    msg_text = (
+        f"✅ **Работа добавлена в отчет!**\n"
+        f"🔧 {data['part']} ({qty} шт., {stage}) — **{earned_nh} н/ч**\n\n"
+        f"Хотите добавить еще одну работу за дату **{report_date}**?"
+    )
+    
+    await callback.message.answer(msg_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    await state.set_state(ReportForm.batch_action)
+    await callback.answer()
+
+@router.callback_query(ReportForm.batch_action, F.data == "batch_add_more")
+async def process_batch_add_more(callback: CallbackQuery, state: FSMContext):
+    await ask_plane_for_report(callback.message, state)
+    await callback.answer()
+
+@router.callback_query(ReportForm.batch_action, F.data == "batch_finish")
+async def process_batch_finish(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    user_data = await asyncio.to_thread(get_user_data, callback.from_user.id)
+    user_fio = user_data["fio"] if user_data else f"ID: {callback.from_user.id}"
+    report_date = data.get("report_date", datetime.datetime.now().strftime("%d.%m.%Y"))
+    
+    batch = data.get("batch_items", [])
+    batch_total = sum(item["earned_nh"] for item in batch)
+    
     total_daily_nh = await asyncio.to_thread(calculate_daily_hours, user_fio, report_date)
     
     is_admin = user_data.get("role") in ["Руководитель", "Админ"] if user_data else False
     await state.clear()
     
     congrat_msg = (
-        f"✅ **Отчет успешно сохранен!**\n\n"
-        f"⏱ За эту работу зачислено: **{earned_nh} н/ч** ({qty} шт.)\n"
-        f"🥳 **Ура, ты молодец!** Всего за **{report_date}** у тебя: **{total_daily_nh} н/ч**! 🎉"
+        f"🎉 **Отчет за {report_date} успешно сдан!**\n\n"
+        f"📊 Добавлено работ в сессии: **{len(batch)}**\n"
+        f"⏱ Начислено за этот отчет: **{round(batch_total, 2)} н/ч**\n\n"
+        f"🥳 **Ура, ты молодец!** Всего за **{report_date}** у тебя: **{total_daily_nh} н/ч**! 🏆"
     )
     
     await callback.message.answer(congrat_msg, reply_markup=main_menu_keyboard(is_admin), parse_mode="Markdown")
     await callback.answer()
+
+
+# --- РАЗДЕЛ "МОИ ОТЧЕТЫ" (ПРОСМОТР, РЕДАКТИРОВАНИЕ, УДАЛЕНИЕ) ---
+@router.message(F.text == "📋 Мои отчеты")
+async def show_my_reports(message: Message):
+    user_data = await asyncio.to_thread(get_user_data, message.from_user.id)
+    if not user_data:
+        await message.answer("Сначала зарегистрируйтесь в системе.")
+        return
+    
+    fio = user_data["fio"]
+    reports = await asyncio.to_thread(get_user_reports_with_row, fio)
+    
+    if not reports:
+        await message.answer("У вас пока нет сданных отчетов.")
+        return
+    
+    await message.answer(f"📋 **Ваши последние отчеты ({len(reports[-10:])} шт.):**", parse_mode="Markdown")
+    
+    for r in reports[-10:]:
+        text = (
+            f"📅 Дата: `{r['date']}` | Борт: **{r['plane']}**\n"
+            f"🔧 Деталь: {r['part']} ({r['qty']} шт.)\n"
+            f"📌 Этап: {r['stage']} | ⏱ Заработано: **{r['earned_nh']} н/ч**\n"
+            f"💬 {r['desc']}\n"
+        )
+        
+        kb = [
+            [
+                InlineKeyboardButton(text="✏ Изменить кол-во", callback_data=f"edit_qty:{r['row_idx']}"),
+                InlineKeyboardButton(text="❌ Удалить", callback_data=f"del_rep:{r['row_idx']}")
+            ]
+        ]
+        
+        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+
+@router.callback_query(F.data.startswith("del_rep:"))
+async def process_delete_report(callback: CallbackQuery):
+    row_idx = int(callback.data.split(":")[1])
+    
+    _, ws_reports, _ = await asyncio.to_thread(get_sheets)
+    await asyncio.to_thread(ws_reports.delete_rows, row_idx)
+    
+    await callback.message.edit_text("🗑 **Отчет успешно удален из таблицы.**", parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("edit_qty:"))
+async def process_prompt_edit_qty(callback: CallbackQuery, state: FSMContext):
+    row_idx = int(callback.data.split(":")[1])
+    await state.update_data(edit_row_idx=row_idx)
+    
+    await callback.message.answer("Введите новое правильное количество штук (например: `12`):", parse_mode="Markdown")
+    await state.set_state(EditReportState.waiting_new_qty)
+    await callback.answer()
+
+@router.message(EditReportState.waiting_new_qty)
+async def process_apply_new_qty(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if not text.isdigit() or int(text) <= 0:
+        await message.answer("Пожалуйста, введите положительное целое число:")
+        return
+    
+    new_qty = int(text)
+    data = await state.get_data()
+    row_idx = data.get("edit_row_idx")
+    
+    _, ws_reports, _ = await asyncio.to_thread(get_sheets)
+    row_data = await asyncio.to_thread(ws_reports.row_values, row_idx)
+    
+    if len(row_data) >= 7:
+        old_qty = parse_float(row_data[5])
+        old_nh = parse_float(row_data[6])
+        
+        # Перерасчет н/ч на штуку
+        per_item_nh = (old_nh / old_qty) if old_qty > 0 else 0
+        new_nh = round(per_item_nh * new_qty, 2)
+        
+        # Обновляем количество и часы в Google Таблице
+        await asyncio.to_thread(ws_reports.update_cell, row_idx, 6, new_qty)
+        await asyncio.to_thread(ws_reports.update_cell, row_idx, 7, new_nh)
+        
+        await message.answer(f"✅ **Отчет обновлен!** Новое кол-во: **{new_qty} шт.**, зачислено: **{new_nh} н/ч**.", parse_mode="Markdown")
+    else:
+        await message.answer("Ошибка при обновлении строки отчета.")
+        
+    await state.clear()
 
 
 # --- ПАНЕЛЬ РУКОВОДИТЕЛЯ ---
@@ -582,19 +754,28 @@ async def admin_select_user_prompt(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("adm_usr:"))
 async def admin_show_user_reports(callback: CallbackQuery):
     fio = callback.data.split(":")[1]
-    reports = await asyncio.to_thread(get_reports_by_user, fio)
+    reports = await asyncio.to_thread(get_user_reports_with_row, fio)
     
     if not reports:
         await callback.message.answer(f"У сотрудника {fio} пока нет сданных отчетов.")
         await callback.answer()
         return
     
-    text = f"📋 **Последние отчеты сотрудника {fio}:**\n\n"
+    await callback.message.answer(f"📋 **Последние отчеты сотрудника {fio}:**", parse_mode="Markdown")
     for r in reports[-10:]:
-        nh_val = r.get('Заработано Н/ч', 0)
-        text += f"📅 `{r.get('Дата и время')}` | Борт: **{r.get('Бортовой номер')}**\n⚙ Деталь: {r.get('Деталь / Узел')} ({r.get('Количество', 1)} шт.)\n⏱ Заработано: **{nh_val} н/ч**\n📌 Этап: {r.get('Выполненный этап')}\n💬 {r.get('Описание работ')}\n\n"
-    
-    await callback.message.answer(text, parse_mode="Markdown")
+        text = (
+            f"📅 `{r['date']}` | Борт: **{r['plane']}**\n"
+            f"⚙ Деталь: {r['part']} ({r['qty']} шт.)\n"
+            f"⏱ Заработано: **{r['earned_nh']} н/ч**\n"
+            f"📌 Этап: {r['stage']}\n💬 {r['desc']}\n"
+        )
+        await callback.message.answer(text, parse_mode="Markdown")
+        if r['photo'] and r['photo'] != "—":
+            try:
+                await callback.message.answer_photo(r['photo'], caption=f"📸 Фото к отчету {fio}")
+            except Exception:
+                pass
+        
     await callback.answer()
 
 @router.callback_query(F.data == "admin_summary_planes")
