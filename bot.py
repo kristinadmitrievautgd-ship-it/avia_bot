@@ -188,10 +188,44 @@ async def show_planes_list(message: Message):
 async def process_plane_info(callback: CallbackQuery):
     plane_num = callback.data.split(":")[1]
     specs = await asyncio.to_thread(get_plane_specs, plane_num)
-    msg_text = f"✈ **Спецификации по борту {plane_num}:**\n\n"
+    
+    if not specs:
+        await callback.message.answer(f"По борту **{plane_num}** нет сохраненных деталей.", parse_mode="Markdown")
+        await callback.answer()
+        return
+
+    header = f"✈ **Спецификации по борту {plane_num}:**\n\n"
+    current_msg = header
+    messages = []
+    
     for idx, item in enumerate(specs, start=1):
-        msg_text += f"**{idx}. {item.get('Деталь / Узел', '—')}**\n🎨 Краска: `{item.get('Номер / Марка краски', '—')}`\n🧪 Грунт: `{item.get('Грунт / Подготовка', '—')}`\n📅 Сдать до: **{item.get('Срок сдачи (Дедлайн)', '—')}**\n📌 Статус: *{item.get('Текущий статус', 'Не указан')}*\n\n"
-    await callback.message.answer(msg_text, parse_mode="Markdown")
+        part_name = str(item.get('Деталь / Узел') or '—').strip()
+        paint = str(item.get('Номер / Марка краски') or '—').strip()
+        primer = str(item.get('Грунт / Подготовка') or '—').strip()
+        deadline = str(item.get('Срок сдачи (Дедлайн)') or '—').strip()
+        status = str(item.get('Текущий статус') or 'Не указан').strip()
+
+        item_text = (
+            f"**{idx}. {part_name}**\n"
+            f"🎨 Краска: `{paint}`\n"
+            f"🧪 Грунт: `{primer}`\n"
+            f"📅 Сдать до: **{deadline}**\n"
+            f"📌 Статус: *{status}*\n\n"
+        )
+        
+        # Разбиваем сообщение, если длина превышает 3500 символов
+        if len(current_msg) + len(item_text) > 3500:
+            messages.append(current_msg)
+            current_msg = f"✈ **Спецификации по борту {plane_num} (продолжение):**\n\n" + item_text
+        else:
+            current_msg += item_text
+            
+    if current_msg:
+        messages.append(current_msg)
+        
+    for msg in messages:
+        await callback.message.answer(msg, parse_mode="Markdown")
+        
     await callback.answer()
 
 @router.message(F.text == "📝 Сдать отчет")
@@ -233,7 +267,7 @@ async def process_rep_part(callback: CallbackQuery, state: FSMContext):
     
     await state.update_data(part=selected_part)
     
-    stages = ["Подготовлено в покраску", "Готово"]
+    stages = ["Готово", "Структурный ремонт"]
     builder = [[KeyboardButton(text=st)] for st in stages]
     await callback.message.answer(
         f"Выбрана деталь: {selected_part}\nВыберите выполненный этап:", 
