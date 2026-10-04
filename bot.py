@@ -488,11 +488,15 @@ async def process_rep_part(callback: CallbackQuery, state: FSMContext):
     
     await state.update_data(part=part_name, selected_spec=selected_spec)
     
-    stages = ["Готово", "Структурный ремонт"]
+    # 3 варианта этапов с точным разделением часов
+    stages = ["Структурный ремонт", "Покраска", "Готово"]
     builder = [[KeyboardButton(text=st)] for st in stages]
     
     await callback.message.answer(
-        f"Выбрана деталь: **{part_name}**\nВыберите выполненный этап:", 
+        f"Выбрана деталь: **{part_name}**\nВыберите выполненный этап:\n\n"
+        f"• **Структурный ремонт** — 60% часов\n"
+        f"• **Покраска** — 40% часов\n"
+        f"• **Готово** — 100% часов (полный цикл)", 
         reply_markup=ReplyKeyboardMarkup(keyboard=builder, resize_keyboard=True),
         parse_mode="Markdown"
     )
@@ -592,12 +596,13 @@ async def process_add_item_to_batch(callback: CallbackQuery, state: FSMContext):
     if paint_nh_1st == 0:
         paint_nh_1st = nh_per_1 * 0.40
 
+    # Четкое распределение по выбранной кнопке этапа
     if "структ" in stage.lower():
         earned_nh = round(struct_nh_1st * qty, 2)
-    elif "готов" in stage.lower():
-        earned_nh = round(nh_per_1 * qty, 2)
-    else:
+    elif "покраск" in stage.lower():
         earned_nh = round(paint_nh_1st * qty, 2)
+    else:  # Готово (полный цикл)
+        earned_nh = round(nh_per_1 * qty, 2)
 
     report_date = data.get("report_date", datetime.datetime.now().strftime("%d.%m.%Y"))
 
@@ -920,7 +925,7 @@ async def admin_summary_planes(callback: CallbackQuery):
     await callback.answer()
 
 
-# --- ВЕБ-СЕРВЕР ДЛЯ РЕНДЕРА И ВЕБХУКОВ (ФИКСОР ПОРТА 503) ---
+# --- ВЕБ-СЕРВЕР ДЛЯ РЕНДЕРА И ВЕБХУКОВ ---
 async def handle_ping(request):
     return web.Response(text="Bot is running")
 
@@ -930,7 +935,6 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # Строго считываем порт, который выделяет Render (или используем 10000)
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
