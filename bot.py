@@ -596,12 +596,12 @@ async def process_add_item_to_batch(callback: CallbackQuery, state: FSMContext):
     if paint_nh_1st == 0:
         paint_nh_1st = nh_per_1 * 0.40
 
-    # Четкое распределение по выбранной кнопке этапа
+    # Четкое распределение часов по выбранному этапу
     if "структ" in stage.lower():
         earned_nh = round(struct_nh_1st * qty, 2)
     elif "покраск" in stage.lower():
         earned_nh = round(paint_nh_1st * qty, 2)
-    else:  # Готово (полный цикл)
+    else:  # Готово (100% полный цикл)
         earned_nh = round(nh_per_1 * qty, 2)
 
     report_date = data.get("report_date", datetime.datetime.now().strftime("%d.%m.%Y"))
@@ -756,7 +756,7 @@ async def process_apply_new_qty(message: Message, state: FSMContext):
     await state.clear()
 
 
-# --- ПАНЕЛЬ РУКОВОДИТЕЛЯ ---
+# --- ПАНЕЛЬ РУКОВОДИТЕЛЯ (С ИСПРАВЛЕННЫМИ КОРОТКИМИ CALLBACK ДЛЯ КНОПОК) ---
 @router.message(F.text == "👔 Панель руководителя")
 async def admin_panel(message: Message):
     user_data = await asyncio.to_thread(get_user_data, message.from_user.id)
@@ -771,32 +771,49 @@ async def admin_panel(message: Message):
     await message.answer("👔 **Панель управления руководителя:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
 
 @router.callback_query(F.data == "admin_search_user")
-async def admin_select_user_prompt(callback: CallbackQuery):
+async def admin_select_user_prompt(callback: CallbackQuery, state: FSMContext):
     _, _, ws_users = await asyncio.to_thread(get_sheets)
     users = [r.get("ФИО") for r in ws_users.get_all_records() if r.get("ФИО")]
     
-    builder = [[InlineKeyboardButton(text=u, callback_data=f"adm_usr:{u}")] for u in users]
+    await state.update_data(admin_users_list=users)
+    
+    builder = [[InlineKeyboardButton(text=u, callback_data=f"adm_u_idx:{i}")] for i, u in enumerate(users)]
     await callback.message.answer("Выберите сотрудника для просмотра отчета:", reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
     await callback.answer()
 
-@router.callback_query(F.data.startswith("adm_usr:"))
-async def admin_select_period(callback: CallbackQuery):
-    fio = callback.data.split(":")[1]
+@router.callback_query(F.data.startswith("adm_u_idx:"))
+async def admin_select_period(callback: CallbackQuery, state: FSMContext):
+    user_idx = int(callback.data.split(":")[1])
+    data = await state.get_data()
+    users = data.get("admin_users_list", [])
+    
+    if user_idx >= len(users):
+        await callback.message.answer("❌ Ошибка: сотрудник не найден. Попробуйте снова.")
+        await callback.answer()
+        return
+        
+    fio = users[user_idx]
+    await state.update_data(admin_selected_fio=fio)
     
     kb = [
-        [InlineKeyboardButton(text="📅 За сегодня", callback_data=f"adm_p:today:{fio}")],
-        [InlineKeyboardButton(text="🗓 За 7 дней", callback_data=f"adm_p:7days:{fio}")],
-        [InlineKeyboardButton(text="📊 За этот месяц", callback_data=f"adm_p:month:{fio}")],
-        [InlineKeyboardButton(text="📁 Все отчеты", callback_data=f"adm_p:all:{fio}")]
+        [InlineKeyboardButton(text="📅 За сегодня", callback_data="adm_p:today")],
+        [InlineKeyboardButton(text="🗓 За 7 дней", callback_data="adm_p:7days")],
+        [InlineKeyboardButton(text="📊 За этот месяц", callback_data="adm_p:month")],
+        [InlineKeyboardButton(text="📁 Все отчеты", callback_data="adm_p:all")]
     ]
     await callback.message.answer(f"Выберите период для **{fio}**:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
     await callback.answer()
 
 @router.callback_query(F.data.startswith("adm_p:"))
-async def admin_show_user_summary(callback: CallbackQuery):
-    parts = callback.data.split(":", 2)
-    period_type = parts[1]
-    fio = parts[2]
+async def admin_show_user_summary(callback: CallbackQuery, state: FSMContext):
+    period_type = callback.data.split(":")[1]
+    data = await state.get_data()
+    fio = data.get("admin_selected_fio")
+    
+    if not fio:
+        await callback.message.answer("❌ Сессия устарела. Пожалуйста, начните поиск заново через «Панель руководителя».")
+        await callback.answer()
+        return
     
     all_reports = await asyncio.to_thread(get_user_reports_with_row, fio)
     
@@ -873,17 +890,21 @@ async def admin_show_user_summary(callback: CallbackQuery):
     for idx, msg in enumerate(messages):
         kb = None
         if idx == len(messages) - 1 and photos_list:
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"📸 Показать фото ({len(photos_list)} шт.)", callback_data=f"show_ph:{fio}:{period_type}")]])
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"📸 Показать фото ({len(photos_list)} шт.)", callback_data=f"show_ph:{period_type}")]])
         await callback.message.answer(msg, reply_markup=kb, parse_mode="Markdown")
 
     await callback.answer()
 
 @router.callback_query(F.data.startswith("show_ph:"))
-async def admin_show_photos(callback: CallbackQuery):
-    parts = callback.data.split(":", 2)
-    period_type = parts[1]
-    fio = parts[2]
+async def admin_show_photos(callback: CallbackQuery, state: FSMContext):
+    period_type = callback.data.split(":")[1]
+    data = await state.get_data()
+    fio = data.get("admin_selected_fio")
     
+    if not fio:
+        await callback.answer("Сессия истекла.", show_alert=True)
+        return
+        
     all_reports = await asyncio.to_thread(get_user_reports_with_row, fio)
     today_dt = datetime.datetime.now().date()
     
